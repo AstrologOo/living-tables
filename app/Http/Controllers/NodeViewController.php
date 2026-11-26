@@ -53,8 +53,9 @@ class NodeViewController extends Controller
             'limit_count' => 'nullable|integer|min:1|max:2147483647',
         ]);
 
-        // A condition is a value (equality) or {cmp, value}. Laravel rules can't express that, and a rule for a nested
-        // key would make validate() drop the short form, so the query builder checks the filter, as when reading.
+        // A column takes a value (equality), {cmp, value} or a list of those. Laravel rules can't express that, and a
+        // rule for a nested key would make validate() drop the short form, so the query builder checks the filter, as
+        // when reading.
         try {
             $queryBuilder->assertCriteria($node, $data['filter'] ?? [], $data['sort_field'] ?? null, $data['unique_field'] ?? null);
         } catch (InvalidArgumentException $e) {

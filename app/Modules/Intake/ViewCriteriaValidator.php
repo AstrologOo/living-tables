@@ -3,7 +3,6 @@
 namespace App\Modules\Intake;
 
 use App\Modules\Intake\Exceptions\ViewCriteriaValidationException;
-use InvalidArgumentException;
 use Opis\JsonSchema\Validator;
 
 /**
@@ -40,31 +39,27 @@ class ViewCriteriaValidator
     /**
      * @param  array<string, mixed>  $criteria  already schema-valid; `filter` is a list of {field, cmp, value}
      * @param  array<string, string>  $colIdByName  column name => col_id, this node's own columns_schema
-     * @return array<string, mixed> filter re-keyed to col_id => value or {cmp, value}; sort and unique fields resolved
+     * @return array<string, mixed> filter re-keyed to col_id => value or {cmp, value}, or a list of {cmp, value} for
+     *                              a column with several conditions; sort and unique fields resolved
      *
      * @throws ViewCriteriaValidationException if a referenced column doesn't exist on this node
-     * @throws InvalidArgumentException if a column has several conditions; the generator doesn't retry this one, as
-     *                                  the model could satisfy it by dropping a condition
      */
     public function resolveColumnReferences(array $criteria, array $colIdByName): array
     {
         $resolved = $criteria;
 
         if (isset($criteria['filter'])) {
-            $resolved['filter'] = [];
+            $byColumn = [];
 
             foreach ($criteria['filter'] as $entry) {
-                $colId = $this->resolveName($entry['field'], $colIdByName);
-
-                // The saved filter is keyed by column, so a second condition would replace the first.
-                if (isset($resolved['filter'][$colId])) {
-                    throw new InvalidArgumentException("Колонка «{$entry['field']}»: для одной колонки вид пока поддерживает одно условие.");
-                }
-
-                $resolved['filter'][$colId] = $entry['cmp'] === '=='
-                    ? $entry['value']
-                    : ['cmp' => $entry['cmp'], 'value' => $entry['value']];
+                $byColumn[$this->resolveName($entry['field'], $colIdByName)][] = ['cmp' => $entry['cmp'], 'value' => $entry['value']];
             }
+
+            $resolved['filter'] = array_map(fn (array $conditions): mixed => match (true) {
+                count($conditions) > 1 => $conditions,
+                $conditions[0]['cmp'] === '==' => $conditions[0]['value'],
+                default => $conditions[0],
+            }, $byColumn);
         }
 
         if (isset($criteria['sort_field'])) {

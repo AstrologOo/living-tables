@@ -518,7 +518,12 @@ paths:
       description: >
         Read-only - never touches dsl_config/status/triggers a
         recompute, just reads whatever the last successful run produced.
-        Filters use the same vocabulary as a saved View's filter. In a
+        Filters use the same vocabulary as a saved View's filter: per
+        column a value (equality), {cmp, value} or a list of 1 to 20
+        {cmp, value}; all conditions are joined with AND, there is no OR.
+        A list is written with an index per condition, e.g. a range:
+        ?filter[price][0][cmp]=>=&filter[price][0][value]=100&filter[price][1][cmp]=<=&filter[price][1][value]=500
+        (percent-encode the operators where the client doesn't). In a
         number column, a value that isn't a number (as JSON writes one,
         below 1e100) counts as null: it matches no comparison and sorts
         last. Filtering such a column by a non-number is 422, except with
@@ -538,6 +543,16 @@ paths:
             enum: ["==", "!=", ">", "<", ">=", "<=", "contains"]
         - name: filter[col_id][value]
           in: query
+          schema: {}
+        - name: filter[col_id][n][cmp]
+          in: query
+          description: 'List form, n = 0, 1, ... - several conditions on one column, e.g. filter[price][0][cmp]=>=.'
+          schema:
+            type: string
+            enum: ["==", "!=", ">", "<", ">=", "<=", "contains"]
+        - name: filter[col_id][n][value]
+          in: query
+          description: 'The value of condition n, e.g. filter[price][0][value]=100.'
           schema: {}
         - name: sort
           in: query
@@ -575,8 +590,11 @@ paths:
       summary: One collapsed row of aggregates over the node's current rows
       operationId: getNodeAggregate
       description: >
-        Same filter vocabulary as /rows. col is ignored for count. sum, avg,
-        median, stddev and variance need a number column (422 otherwise).
+        Same filter vocabulary as /rows, including a list of conditions on
+        one column, e.g.
+        ?aggregate[n][fn]=count&filter[price][0][cmp]=>=&filter[price][0][value]=100&filter[price][1][cmp]=<=&filter[price][1][value]=500.
+        col is ignored for count. sum, avg, median, stddev and variance
+        need a number column (422 otherwise).
       parameters:
         - $ref: '#/components/parameters/NodeId'
         - name: aggregate[alias][fn]
@@ -592,8 +610,26 @@ paths:
             type: string
         - name: filter[col_id]
           in: query
+          description: Equality shorthand.
           schema:
             type: string
+        - name: filter[col_id][cmp]
+          in: query
+          schema:
+            type: string
+            enum: ["==", "!=", ">", "<", ">=", "<=", "contains"]
+        - name: filter[col_id][value]
+          in: query
+          schema: {}
+        - name: filter[col_id][n][cmp]
+          in: query
+          description: 'List form, n = 0, 1, ... - several conditions on one column.'
+          schema:
+            type: string
+            enum: ["==", "!=", ">", "<", ">=", "<=", "contains"]
+        - name: filter[col_id][n][value]
+          in: query
+          schema: {}
       responses:
         '200':
           description: One key per requested alias; null values for a node with no version yet.
@@ -611,7 +647,7 @@ paths:
                         - type: number
                         - type: string
         '422':
-          description: Unknown function, undeclared column, or an unsafe alias.
+          description: Unknown function, undeclared column, an unsafe alias, a malformed filter, or a non-number compared with a number column.
         '404':
           $ref: '#/components/responses/NotFoundOrNotYours'
 
@@ -680,7 +716,8 @@ paths:
         Criteria are checked against the node's columns as when rows are
         read, so a node without columns yet accepts only a view that names
         none. The filter is saved and returned with every condition as
-        {cmp, value}.
+        {cmp, value}: a column with one condition holds that object, a
+        column with several holds a list of them.
       parameters:
         - $ref: '#/components/parameters/NodeId'
       requestBody:
@@ -697,18 +734,9 @@ paths:
                       type: string
                     filter:
                       type: object
-                      description: 'Per column: a bare scalar for equality, or {cmp, value} (cmp defaults to ==; no other keys).'
+                      description: 'Per column: a bare scalar for equality, {cmp, value} (cmp defaults to ==; no other keys), or a list of 1 to 20 of those objects. All conditions are joined with AND.'
                       additionalProperties:
-                        oneOf:
-                          - {}
-                          - type: object
-                            required: [value]
-                            additionalProperties: false
-                            properties:
-                              cmp:
-                                type: string
-                                enum: ["==", "!=", ">", "<", ">=", "<=", "contains"]
-                              value: {}
+                        $ref: '#/components/schemas/ColumnFilter'
                     sort_field:
                       type: string
                       nullable: true
@@ -741,6 +769,15 @@ paths:
                   sort_field: "comments"
                   sort_order: "desc"
                   limit_count: 5
+              rangeCriteria:
+                summary: A range - two conditions on one column
+                value:
+                  name: "Mid-priced"
+                  filter:
+                    price:
+                      - { cmp: ">=", value: 100 }
+                      - { cmp: "<=", value: 500 }
+                  sort_field: "price"
               fromPhrase:
                 summary: From phrase (LLM)
                 value:
@@ -764,7 +801,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFoundOrNotYours'
         '422':
-          description: 'Nothing is saved: explicit criteria name an unknown column, compare a number column with a non-number or are malformed; or phrase-generated criteria never validated (schema-invalid, or referenced a column that doesn''t exist on this node) after retrying, or put two conditions on one column (a view holds one per column).'
+          description: 'Nothing is saved: explicit criteria name an unknown column, compare a number column with a non-number or are malformed; or phrase-generated criteria never validated (schema-invalid, or referenced a column that doesn''t exist on this node) after retrying, or can''t be applied to this node (as a non-number compared with a number column).'
         '503':
           $ref: '#/components/responses/GenerationUnavailable'
     get:
@@ -841,7 +878,7 @@ paths:
                       last_page:
                         type: integer
         '422':
-          description: The saved filter references an unsupported cmp or an undeclared column.
+          description: The saved filter is malformed or references an unsupported cmp or an undeclared column.
         '404':
           $ref: '#/components/responses/NotFoundOrNotYours'
 
@@ -1243,6 +1280,33 @@ components:
           type: string
           format: date-time
 
+    FilterCondition:
+      type: object
+      required: [value]
+      additionalProperties: false
+      properties:
+        cmp:
+          type: string
+          enum: ["==", "!=", ">", "<", ">=", "<=", "contains"]
+          default: "=="
+        value: {}
+
+    ColumnFilter:
+      description: The conditions on one column.
+      oneOf:
+        - title: A value (equality)
+          oneOf:
+            - type: string
+            - type: number
+            - type: boolean
+        - $ref: '#/components/schemas/FilterCondition'
+        - title: Several conditions, joined with AND
+          type: array
+          minItems: 1
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/FilterCondition'
+
     NodeView:
       type: object
       properties:
@@ -1259,7 +1323,9 @@ components:
         filter:
           type: object
           nullable: true
-          description: 'col_id => {cmp, value}. Views saved earlier may hold a bare value, meaning equality.'
+          description: 'col_id => {cmp, value}, or a list of them when the column has several conditions. Views saved earlier may hold a bare value, meaning equality.'
+          additionalProperties:
+            $ref: '#/components/schemas/ColumnFilter'
         sort_field:
           type: string
           nullable: true

@@ -4,7 +4,6 @@ namespace App\Modules\Intake;
 
 use App\Modules\Intake\Exceptions\ViewCriteriaValidationException;
 use App\Modules\Shared\Contracts\LlmProvider;
-use InvalidArgumentException;
 
 /**
  * Turns a phrase into validated view criteria for one node, with columns resolved to col_id, retrying once if
@@ -30,7 +29,6 @@ class ViewCriteriaGenerator
      * @return array<string, mixed> a schema-valid criteria object with column references already translated to col_id
      *
      * @throws ViewCriteriaValidationException if the model still fails to produce valid criteria after one retry
-     * @throws InvalidArgumentException if a column got several conditions
      */
     public function generate(string $userPhrase, array $columnsSchema, ?string $priorAttemptFeedback = null): array
     {

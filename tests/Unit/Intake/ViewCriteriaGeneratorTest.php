@@ -55,6 +55,22 @@ it('keeps a non-equality cmp as {cmp, value} in the resolved filter, not just a 
     expect($result['filter'])->toBe(['col_comments' => ['cmp' => '>', 'value' => '10']]);
 });
 
+it('collects the conditions on one column into a list, in the order given', function () use ($columnsSchema) {
+    $llm = new RecordingLlmProvider([['filter' => [
+        ['field' => 'comments', 'cmp' => '>=', 'value' => '5'],
+        ['field' => 'category', 'cmp' => '==', 'value' => 'bug'],
+        ['field' => 'comments', 'cmp' => '<=', 'value' => '10'],
+        ['field' => 'comments', 'cmp' => '==', 'value' => '7'],
+    ]]]);
+
+    $result = (new ViewCriteriaGenerator($llm))->generate('баги, комментариев от 5 до 10', $columnsSchema);
+
+    expect($result['filter'])->toBe([
+        'col_comments' => [['cmp' => '>=', 'value' => '5'], ['cmp' => '<=', 'value' => '10'], ['cmp' => '==', 'value' => '7']],
+        'col_category' => 'bug',
+    ]);
+});
+
 it('retries once with the validation error appended when the first response is schema-invalid', function () use ($columnsSchema, $validCriteria) {
     $llm = new RecordingLlmProvider([
         ['sort_order' => 'sideways'], // not in enum -> schema-invalid

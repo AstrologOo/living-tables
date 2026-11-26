@@ -23,6 +23,9 @@ class NodeRowQueryBuilder
     /** The highest page number read; beyond it the offset would overflow. */
     public const MAX_PAGE = 1_000_000_000;
 
+    /** The most conditions one column takes; it keeps the number of bound values within what a database accepts. */
+    public const MAX_CONDITIONS_PER_COLUMN = 20;
+
     /** Filter comparisons and their SQL operators; `contains` is handled apart. */
     private const COMPARISONS = ['==' => '=', '!=' => '!=', '>' => '>', '<' => '<', '>=' => '>=', '<=' => '<='];
 
@@ -30,8 +33,9 @@ class NodeRowQueryBuilder
      * Returns null when the node has no version yet. $uniqueField keeps the first inserted row for each value, and
      * sorting applies to the deduplicated result.
      *
-     * @param  array<string, mixed>  $filters  col_id => value for equality, or col_id => {cmp, value}
-     *                                         (cmp: ==, !=, >, <, >=, <=, contains)
+     * @param  array<string, mixed>  $filters  col_id => a value (equality), {cmp, value} or a non-empty list of
+     *                                         {cmp, value}; cmp: ==, !=, >, <, >=, <=, contains. All are joined
+     *                                         with AND.
      *
      * @throws InvalidArgumentException if a filter/sort/unique field references an undeclared column, or a filter is
      *                                  malformed or compares a number column with something else
@@ -92,17 +96,22 @@ class NodeRowQueryBuilder
     }
 
     /**
-     * Spells every condition out as {cmp, value}, the form a view is saved in.
+     * Spells every condition out as {cmp, value}, the form a view is saved in: one per column as that object,
+     * several as a list of them.
      *
      * @param  array<int|string, mixed>  $filters  already checked by assertCriteria()
-     * @return array<int|string, array{cmp: mixed, value: mixed}>
+     * @return array<int|string, array{cmp: mixed, value: mixed}|list<array{cmp: mixed, value: mixed}>>
      */
     public function fullFilters(array $filters): array
     {
         return array_map(function (mixed $criterion): array {
-            [$cmp, $value] = $this->comparison($criterion);
+            $full = array_map(function (mixed $condition): array {
+                [$cmp, $value] = $this->comparison($condition);
 
-            return ['cmp' => $cmp, 'value' => $value];
+                return ['cmp' => $cmp, 'value' => $value];
+            }, $this->conditions($criterion));
+
+            return count($full) === 1 ? $full[0] : $full;
         }, $filters);
     }
 
@@ -150,25 +159,47 @@ class NodeRowQueryBuilder
     private function applyFilters(Builder|BaseBuilder $query, Node $node, array $filters): void
     {
         foreach ($filters as $colId => $criterion) {
-            [$cmp, $value] = $this->comparison($criterion);
-
-            if ($cmp === 'contains') {
-                $query->whereRaw('node_rows.data->>? LIKE ?', [$colId, '%'.$value.'%']);
-
-                continue;
+            foreach ($this->conditions($criterion) as $condition) {
+                $this->applyCondition($query, $node, $colId, $condition);
             }
-
-            $sqlOp = self::COMPARISONS[$cmp];
-
-            if ($this->isNumberColumn($node, $colId)) {
-                [$expr, $bindings] = NumericValue::sql($colId, DB::connection()->getDriverName());
-                $query->whereRaw("{$expr} {$sqlOp} CAST(? AS NUMERIC)", [...$bindings, trim((string) $value)]);
-
-                continue;
-            }
-
-            $query->whereRaw("node_rows.data->>? {$sqlOp} ?", [$colId, $value]);
         }
+    }
+
+    private function applyCondition(Builder|BaseBuilder $query, Node $node, int|string $colId, mixed $condition): void
+    {
+        [$cmp, $value] = $this->comparison($condition);
+
+        if ($cmp === 'contains') {
+            $query->whereRaw('node_rows.data->>? LIKE ?', [$colId, '%'.$value.'%']);
+
+            return;
+        }
+
+        $sqlOp = self::COMPARISONS[$cmp];
+
+        if ($this->isNumberColumn($node, $colId)) {
+            [$expr, $bindings] = NumericValue::sql($colId, DB::connection()->getDriverName());
+            $query->whereRaw("{$expr} {$sqlOp} CAST(? AS NUMERIC)", [...$bindings, trim((string) $value)]);
+
+            return;
+        }
+
+        $query->whereRaw("node_rows.data->>? {$sqlOp} ?", [$colId, $value]);
+    }
+
+    /**
+     * What one column's filter holds: the items of a list, or the single condition it is.
+     *
+     * @return list<mixed>
+     */
+    private function conditions(mixed $criterion): array
+    {
+        return $this->isList($criterion) ? $criterion : [$criterion];
+    }
+
+    private function isList(mixed $criterion): bool
+    {
+        return is_array($criterion) && array_is_list($criterion);
     }
 
     /**
@@ -191,27 +222,53 @@ class NodeRowQueryBuilder
         foreach ($filters as $colId => $criterion) {
             $this->assertColumn($node, $colId);
 
-            // Anything else, like a list or a misspelt key, would silently be compared with null.
-            if (is_array($criterion) && (! array_key_exists('value', $criterion) || array_diff_key($criterion, ['cmp' => 0, 'value' => 0]) !== [])) {
-                throw new InvalidArgumentException('Filter on column '.$this->quote($colId).' must be a value or {cmp, value}.');
+            if ($this->isList($criterion)) {
+                if (count($criterion) > self::MAX_CONDITIONS_PER_COLUMN) {
+                    throw new InvalidArgumentException('Filter on column '.$this->quote($colId).' takes at most '.self::MAX_CONDITIONS_PER_COLUMN.' conditions.');
+                }
+
+                // A list holds conditions only; a bare value in it would read as one more allowed value.
+                if ($criterion === [] || array_filter($criterion, is_array(...)) !== $criterion) {
+                    throw $this->malformed($colId);
+                }
             }
 
-            [$cmp, $value] = $this->comparison($criterion);
-
-            if ($cmp !== 'contains' && (! is_string($cmp) || ! isset(self::COMPARISONS[$cmp]))) {
-                throw new InvalidArgumentException('Unsupported filter cmp: '.$this->quote($cmp).'.');
-            }
-
-            // Postgres refuses NUL and bytes that aren't UTF-8.
-            if (($value !== null && ! is_scalar($value))
-                || (is_string($value) && (! mb_check_encoding($value, 'UTF-8') || str_contains($value, "\0")))) {
-                throw new InvalidArgumentException('Filter on column '.$this->quote($colId).' needs a single text or number value.');
-            }
-
-            if ($cmp !== 'contains' && $this->isNumberColumn($node, $colId) && ! NumericValue::accepts($value)) {
-                throw new InvalidArgumentException('Filter on number column '.$this->quote($colId).' needs a number, not '.$this->quote($value).'.');
+            foreach ($this->conditions($criterion) as $condition) {
+                $this->assertCondition($node, $colId, $condition);
             }
         }
+    }
+
+    /**
+     * @throws InvalidArgumentException
+     */
+    private function assertCondition(Node $node, int|string $colId, mixed $condition): void
+    {
+        // Anything else, like a nested list or a misspelt key, would silently be compared with null.
+        if (is_array($condition) && (! array_key_exists('value', $condition) || array_diff_key($condition, ['cmp' => 0, 'value' => 0]) !== [])) {
+            throw $this->malformed($colId);
+        }
+
+        [$cmp, $value] = $this->comparison($condition);
+
+        if ($cmp !== 'contains' && (! is_string($cmp) || ! isset(self::COMPARISONS[$cmp]))) {
+            throw new InvalidArgumentException('Unsupported filter cmp: '.$this->quote($cmp).'.');
+        }
+
+        // Postgres refuses NUL and bytes that aren't UTF-8.
+        if (($value !== null && ! is_scalar($value))
+            || (is_string($value) && (! mb_check_encoding($value, 'UTF-8') || str_contains($value, "\0")))) {
+            throw new InvalidArgumentException('Filter on column '.$this->quote($colId).' needs a single text or number value.');
+        }
+
+        if ($cmp !== 'contains' && $this->isNumberColumn($node, $colId) && ! NumericValue::accepts($value)) {
+            throw new InvalidArgumentException('Filter on number column '.$this->quote($colId).' needs a number, not '.$this->quote($value).'.');
+        }
+    }
+
+    private function malformed(int|string $colId): InvalidArgumentException
+    {
+        return new InvalidArgumentException('Filter on column '.$this->quote($colId).' must be a value, {cmp, value} or a list of {cmp, value}.');
     }
 
     /**

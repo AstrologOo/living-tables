@@ -64,7 +64,15 @@ that isn't a number answers 422; `contains` compares text. Numbers are written a
 numbers.
 
 A new view is checked the same way: an unknown column, such a value or a malformed filter answers 422 and nothing is
-saved. A filter condition is a value (equality) or `{"cmp": ..., "value": ...}`, and is saved in the second form.
+saved.
+
+A filter maps a column to a value (equality), to `{"cmp": ..., "value": ...}` or to a list of up to 20 such objects;
+`cmp` is one of the comparisons of the `filter` operation. Every condition must hold (AND; there is no OR). A view
+saves one condition as an object and several as a list. In a query string a list takes an index per condition:
+
+```
+?filter[price][0][cmp]=>=&filter[price][0][value]=100&filter[price][1][cmp]=<=&filter[price][1][value]=500
+```
 
 ## Architecture
 
@@ -280,8 +288,6 @@ The compose file is for development (default passwords, debug on). For anything 
   `schema_drift`.
 - Without a sort, rows changed by a recompute move to the end of the table.
 - A new node without a config is `fresh` at once, with an empty table.
-- A view holds one condition per column, so it can't express a range such as "price from 5 to 10"; a phrase that
-  needs two answers 422.
 
 ## Documentation
 

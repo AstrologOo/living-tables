@@ -39,7 +39,7 @@ class ViewFromPhraseService
 
             try {
                 $criteria = $this->generator->generate($phrase, $columnsSchema, $feedback);
-            } catch (ViewCriteriaValidationException|InvalidArgumentException $e) {
+            } catch (ViewCriteriaValidationException $e) {
                 $this->recordGenerationStat($node, $startedAt, 'view_generation_failed');
 
                 throw $e;

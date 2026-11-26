@@ -258,21 +258,20 @@ it('store with a phrase retries when the generated criteria matches nothing on a
         ->and($response->json('rows'))->toHaveCount(2);
 });
 
-it('store with a phrase answers 422 to two conditions on one column instead of losing one', function () {
+it('store with a phrase saves two conditions on one column as a range', function () {
     [, $node] = nodeWithBugRows();
-    $node->update(['columns_schema' => ['price' => ['name' => 'price', 'type' => 'number']]]);
-    $range = ['filter' => [['field' => 'price', 'cmp' => '>=', 'value' => '5'], ['field' => 'price', 'cmp' => '<=', 'value' => '10']]];
-    // A second answer is ready: asked again, the model could just drop a bound.
-    $llm = new RecordingLlmProvider([$range, ['filter' => [$range['filter'][1]]]], tokensPerCall: 7);
+    $llm = new RecordingLlmProvider([
+        ['filter' => [['field' => 'comments', 'cmp' => '>=', 'value' => '5'], ['field' => 'comments', 'cmp' => '<=', 'value' => '10']]],
+    ]);
     $this->app->instance(LlmProvider::class, $llm);
 
-    $response = $this->postJson("/api/nodes/{$node->id}/views", ['name' => 'Range', 'phrase' => 'цена от 5 до 10'])
-        ->assertStatus(422);
+    $response = $this->postJson("/api/nodes/{$node->id}/views", ['name' => 'Range', 'phrase' => 'комментариев от 5 до 10'])
+        ->assertCreated();
 
-    expect($response->json('error'))->toContain('для одной колонки вид пока поддерживает одно условие')->toContain('price')
-        ->and($llm->callCount())->toBe(1)
-        ->and(NodeView::where('node_id', $node->id)->count())->toBe(0)
-        ->and(RunStat::where('node_id', $node->id)->where('status', 'view_generation_failed')->value('tokens_spent'))->toBe(7);
+    expect($llm->callCount())->toBe(1)
+        ->and($response->json('filter.comments'))->toBe([['cmp' => '>=', 'value' => '5'], ['cmp' => '<=', 'value' => '10']])
+        ->and($response->json('rows.*.title'))->toBe(['A'])
+        ->and($this->getJson("/api/views/{$response->json('id')}/rows")->assertOk()->json('data.*.title'))->toBe(['A']);
 });
 
 // --- criteria checked when a view is created ---
