@@ -185,8 +185,9 @@ The API is on `http://localhost:8080`, RabbitMQ's UI on `:15672` (`app`/`secret`
 
 Compose reads these from `.env`: `FORWARD_APP_PORT` (8080), `FORWARD_REVERB_PORT` (8081), `FORWARD_DB_PORT` (5432),
 `FORWARD_REDIS_PORT` (6379), `FORWARD_RABBITMQ_PORT` (5672), `FORWARD_RABBITMQ_UI_PORT` (15672) and `APP_IMAGE`
-(`graph-backend-app:local`). To run two copies side by side, give the second its own ports, `APP_IMAGE` and
-`COMPOSE_PROJECT_NAME`. A new app port also goes into `APP_URL`, a new Reverb port into `VITE_REVERB_PORT`.
+(`living-tables:local`). To run two copies side by side, give the second its own ports, `APP_IMAGE` and
+`COMPOSE_PROJECT_NAME`. A new app port also goes into `APP_URL`; a browser client connects to Reverb on
+`FORWARD_REVERB_PORT`.
 
 ### LLM provider
 

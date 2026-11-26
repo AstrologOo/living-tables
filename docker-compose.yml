@@ -1,7 +1,7 @@
 services:
   app:
     build: .
-    image: ${APP_IMAGE:-graph-backend-app:local}
+    image: ${APP_IMAGE:-living-tables:local}
     volumes:
       - .:/var/www/html
     environment:
@@ -26,7 +26,7 @@ services:
 
   worker:
     build: .
-    image: ${APP_IMAGE:-graph-backend-app:local}
+    image: ${APP_IMAGE:-living-tables:local}
     command: php artisan graph:consume-node-jobs
     # The php-fpm image stops with SIGQUIT; these are CLI processes.
     stop_signal: SIGTERM
@@ -45,7 +45,7 @@ services:
 
   scheduler:
     build: .
-    image: ${APP_IMAGE:-graph-backend-app:local}
+    image: ${APP_IMAGE:-living-tables:local}
     # routes/console.php declares graph:schedule-sources and
     # graph:recover-stuck-nodes on ->everyMinute() — that only registers
     # them, nothing actually ticks the clock without this process (Laravel
@@ -73,11 +73,11 @@ services:
 
   reverb:
     build: .
-    image: ${APP_IMAGE:-graph-backend-app:local}
+    image: ${APP_IMAGE:-living-tables:local}
     # Push transport for node status/notification updates — the app
     # container calls this over the docker network (REVERB_HOST=reverb in
     # .env), a browser connects to the host-published port below
-    # (VITE_REVERB_PORT=8081 — 8080 is already nginx). Exactly one
+    # (FORWARD_REVERB_PORT, 8081 — 8080 is already nginx). Exactly one
     # replica for now: Reverb supports horizontal scaling via its Redis
     # "scaling" mode (config/reverb.php), not enabled here — not needed
     # until connection count actually demands it.

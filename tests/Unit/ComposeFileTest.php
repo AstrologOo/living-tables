@@ -17,7 +17,7 @@ it('lets a second copy of the stack choose its ports and image name, with the sa
     ]);
 
     foreach (['app', 'worker', 'scheduler', 'reverb'] as $service) {
-        expect($compose[$service]['image'])->toBe('${APP_IMAGE:-graph-backend-app:local}');
+        expect($compose[$service]['image'])->toBe('${APP_IMAGE:-living-tables:local}');
     }
 
     foreach (['APP_IMAGE', 'FORWARD_APP_PORT', 'FORWARD_REVERB_PORT', 'FORWARD_DB_PORT', 'FORWARD_REDIS_PORT', 'FORWARD_RABBITMQ_PORT', 'FORWARD_RABBITMQ_UI_PORT'] as $name) {
