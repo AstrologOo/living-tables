@@ -27,7 +27,7 @@ class SqliteAggregateDialect implements AggregateDialect
             AggregateFunction::AVG => "AVG({$col})",
             AggregateFunction::MIN => "MIN({$col})",
             AggregateFunction::MAX => "MAX({$col})",
-            AggregateFunction::MEDIAN => "median({$col})",
+            AggregateFunction::MEDIAN => SqliteMedian::FUNCTION."({$col})",
             default => throw new UnsupportedAggregateException($function, 'sqlite'),
         };
 

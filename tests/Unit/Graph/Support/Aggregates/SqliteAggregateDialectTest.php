@@ -21,10 +21,10 @@ it('throws UnsupportedAggregateException for stddev and variance, rather than fa
         ->toThrow(UnsupportedAggregateException::class, 'not supported on the "sqlite" driver');
 })->with([AggregateFunction::STDDEV, AggregateFunction::VARIANCE]);
 
-it('uses its own lowercase median() function', function () {
+it('uses the median the application registers', function () {
     [$sql] = (new SqliteAggregateDialect)->aggregateExpr(AggregateFunction::MEDIAN, 'price', 'number');
 
-    expect($sql)->toBe('median('.NumericValue::sql('price', 'sqlite')[0].')');
+    expect($sql)->toBe('graph_median('.NumericValue::sql('price', 'sqlite')[0].')');
 });
 
 it('reads a number-typed column as a checked number, as Postgres does', function () {
