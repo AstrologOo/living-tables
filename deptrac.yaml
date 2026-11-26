@@ -1,0 +1,239 @@
+deptrac:
+  paths:
+    - ./app
+
+  exclude_files:
+    - '#.*/tests/.*#'
+
+  layers:
+    - name: Graph
+      collectors:
+        - type: directory
+          value: app/Modules/Graph/.*
+
+    - name: ExecutionPayload
+      collectors:
+        - type: directory
+          value: app/Modules/Execution/Payload\.php
+
+    # RowBatch carries actual row data between chained pipeline steps
+    # within one batch (Payload above is just a pointer into RowStore) —
+    # same "no dependencies at all" requirement as Payload, for the same
+    # reason: Operation::apply()'s signature (ExecutionContracts) and
+    # ParentDataProvider::latestPayload()'s return type both need to
+    # reference it.
+    - name: ExecutionRowBatch
+      collectors:
+        - type: directory
+          value: app/Modules/Execution/RowBatch\.php
+
+    - name: ExecutionContext
+      collectors:
+        - type: directory
+          value: app/Modules/Execution/ExecutionContext\.php
+
+    - name: ExecutionContracts
+      collectors:
+        - type: directory
+          value: app/Modules/Execution/Contracts/.*
+
+    # What a caller may catch or name without touching the pipeline.
+    - name: ExecutionExceptions
+      collectors:
+        - type: directory
+          value: app/Modules/Execution/Exceptions/.*
+
+    # Pipeline internals (Operations, OperationFactory, PipelineRunner) —
+    # everything under Execution/ except the layers above. This is what
+    # Graph must never be allowed to touch.
+    - name: Execution
+      collectors:
+        - type: bool
+          must:
+            - type: directory
+              value: app/Modules/Execution/.*
+          must_not:
+            - type: directory
+              value: app/Modules/Execution/Contracts/.*
+            - type: directory
+              value: app/Modules/Execution/Payload\.php
+            - type: directory
+              value: app/Modules/Execution/RowBatch\.php
+            - type: directory
+              value: app/Modules/Execution/ExecutionContext\.php
+            - type: directory
+              value: app/Modules/Execution/Exceptions/.*
+
+    - name: Intake
+      collectors:
+        - type: directory
+          value: app/Modules/Intake/.*
+
+    # Ports and support code; adapters and exceptions are their own layers.
+    - name: Shared
+      collectors:
+        - type: bool
+          must:
+            - type: directory
+              value: app/Modules/Shared/.*
+          must_not:
+            - type: directory
+              value: app/Modules/Shared/Adapters/.*
+            - type: directory
+              value: app/Modules/Shared/Exceptions/.*
+
+    - name: SharedExceptions
+      collectors:
+        - type: directory
+          value: app/Modules/Shared/Exceptions/.*
+
+    # Vendor code. Only the composition root (Providers) may name it.
+    - name: SharedAdapters
+      collectors:
+        - type: directory
+          value: app/Modules/Shared/Adapters/.*
+
+    - name: Http
+      collectors:
+        - type: directory
+          value: app/Http/.*
+
+    # The CLI process, including the worker that drives Graph and Execution.
+    - name: Console
+      collectors:
+        - type: directory
+          value: app/Console/.*
+
+    - name: Providers
+      collectors:
+        - type: directory
+          value: app/Providers/.*
+
+    - name: Models
+      collectors:
+        - type: directory
+          value: app/Models/.*
+
+    # Code shared by Http and Console.
+    - name: Support
+      collectors:
+        - type: directory
+          value: app/Support/.*
+
+  ruleset:
+    # Graph implements Execution\Contracts\ParentDataProvider and returns
+    # Payload from it, but must never depend on pipeline internals.
+    Graph:
+      - ExecutionContracts
+      - ExecutionPayload
+      - ExecutionRowBatch
+      - Shared
+      - SharedExceptions
+      - Models
+
+    Execution:
+      - ExecutionContracts
+      - ExecutionPayload
+      - ExecutionRowBatch
+      - ExecutionContext
+      - ExecutionExceptions
+      - Shared
+      - SharedExceptions
+
+    # Operation::apply() and ParentDataProvider::latestPayload() reference
+    # Payload/ExecutionContext in their signatures.
+    ExecutionContracts:
+      - ExecutionPayload
+      - ExecutionRowBatch
+      - ExecutionContext
+
+    ExecutionContext:
+      - ExecutionPayload
+      - ExecutionRowBatch
+      - ExecutionContracts
+      - Shared
+
+    ExecutionPayload: []
+
+    ExecutionRowBatch: []
+
+    ExecutionExceptions: []
+
+    # PreviewService (step 4.5) runs PipelineRunner directly, unlike Graph,
+    # which is only ever allowed at the Contracts/Payload surface.
+    Intake:
+      - Graph
+      - Shared
+      - SharedExceptions
+      - Execution
+      - ExecutionContext
+      - ExecutionContracts
+      - ExecutionPayload
+      - ExecutionRowBatch
+      - ExecutionExceptions
+
+    Shared:
+      - SharedExceptions
+
+    SharedExceptions: []
+
+    SharedAdapters:
+      - Shared
+      - SharedExceptions
+
+    # No pipeline types at all: whatever a controller needs from Execution
+    # belongs behind an Intake or Graph service.
+    Http:
+      - Graph
+      - Intake
+      - Shared
+      - SharedExceptions
+      - ExecutionExceptions
+      - Models
+      - Support
+
+    Console:
+      - Graph
+      - Intake
+      - Shared
+      - SharedExceptions
+      - Execution
+      - ExecutionContext
+      - ExecutionContracts
+      - ExecutionPayload
+      - ExecutionRowBatch
+      - ExecutionExceptions
+      - Models
+      - Support
+
+    Providers:
+      - Graph
+      - Intake
+      - Shared
+      - SharedExceptions
+      - SharedAdapters
+      - Execution
+      - ExecutionContext
+      - ExecutionContracts
+      - ExecutionPayload
+      - ExecutionRowBatch
+      - ExecutionExceptions
+      - Models
+
+    Models: []
+
+    Support:
+      - ExecutionExceptions
+      - SharedExceptions
+
+  skip_violations:
+    # A dev command whose whole job is measuring one vendor's cost and
+    # quality: it needs that adapter's usage metadata, which the LlmProvider
+    # port deliberately doesn't expose.
+    App\Console\Commands\IteratePhrases:
+      - App\Modules\Shared\Adapters\Llm\GeminiAdapter
+
+  formatters:
+    graphviz:
+      pointToGroups: false
+      groups: {}

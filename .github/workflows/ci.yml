@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # The suite runs on sqlite (fast, the local default) and on Postgres
+    # (what production uses: row locks like FOR UPDATE / FOR SHARE are
+    # silently ignored by sqlite, so only this leg actually checks them).
+    strategy:
+      fail-fast: false
+      matrix:
+        db: [sqlite, pgsql]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: graph_test
+          POSTGRES_USER: root
+          POSTGRES_PASSWORD: secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U root -d graph_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      rabbitmq:
+        image: rabbitmq:3-management
+        env:
+          RABBITMQ_DEFAULT_USER: app
+          RABBITMQ_DEFAULT_PASS: secret
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      RABBITMQ_HOST: 127.0.0.1
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: app
+      RABBITMQ_PASSWORD: secret
+      RABBITMQ_VHOST: /
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 6379
+      # Real environment variables win over both .env and phpunit.xml.
+      DB_CONNECTION: ${{ matrix.db }}
+      DB_DATABASE: ${{ matrix.db == 'pgsql' && 'graph_test' || ':memory:' }}
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_USERNAME: root
+      DB_PASSWORD: secret
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: pdo, pdo_sqlite, pdo_pgsql, pgsql, pcntl, bcmath, intl, zip, redis, amqp
+          coverage: none
+
+      - name: Copy .env
+        run: cp .env.example .env
+
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Generate app key
+        run: php artisan key:generate
+
+      - name: Pint (code style)
+        run: ./vendor/bin/pint --test
+
+      - name: Deptrac (module boundaries)
+        run: ./vendor/bin/deptrac analyse --no-cache
+
+      - name: Pest (tests)
+        run: php artisan test

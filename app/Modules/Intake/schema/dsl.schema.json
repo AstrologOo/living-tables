@@ -1,0 +1,189 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://graph.local/schema/dsl.schema.json",
+  "title": "DSL pipeline (v1)",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["op"],
+    "oneOf": [
+      { "$ref": "#/definitions/fetch" },
+      { "$ref": "#/definitions/parent" },
+      { "$ref": "#/definitions/document" },
+      { "$ref": "#/definitions/extract" },
+      { "$ref": "#/definitions/filter" },
+      { "$ref": "#/definitions/map" },
+      { "$ref": "#/definitions/merge" },
+      { "$ref": "#/definitions/sort" },
+      { "$ref": "#/definitions/limit" },
+      { "$ref": "#/definitions/unique" },
+      { "$ref": "#/definitions/llm" }
+    ]
+  },
+  "definitions": {
+    "fetch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "url", "format"],
+      "properties": {
+        "op": { "const": "fetch" },
+        "url": { "type": "string", "minLength": 1 },
+        "format": { "enum": ["json", "csv", "html"] },
+        "pagination": { "$ref": "#/definitions/pagination" }
+      }
+    },
+    "pagination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "items_path", "max_pages"],
+      "properties": {
+        "strategy": { "enum": ["page_param", "offset", "cursor", "link_header"] },
+        "items_path": { "type": "string", "minLength": 1 },
+        "param": { "type": "string", "minLength": 1 },
+        "start": { "type": "integer", "minimum": 0 },
+        "cursor_path": { "type": "string", "minLength": 1 },
+        "stop_when": { "enum": ["empty_page", "no_cursor", "max_pages"] },
+        "max_pages": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "max_rows": { "type": "integer", "minimum": 1, "maximum": 200000 },
+        "delay_ms": { "type": "integer", "minimum": 0, "maximum": 5000 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "strategy": { "const": "cursor" } } },
+          "then": { "required": ["cursor_path"] }
+        },
+        {
+          "if": { "properties": { "strategy": { "enum": ["page_param", "offset"] } } },
+          "then": { "required": ["param"] }
+        }
+      ]
+    },
+    "parent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "node"],
+      "properties": {
+        "op": { "const": "parent" },
+        "node": { "type": "string", "minLength": 1 }
+      }
+    },
+    "document": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "file_ref"],
+      "properties": {
+        "op": { "const": "document" },
+        "file_ref": { "type": "string", "minLength": 1 }
+      }
+    },
+    "webhook_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op"],
+      "properties": {
+        "op": { "const": "webhook_source" }
+      }
+    },
+    "extract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "path"],
+      "properties": {
+        "op": { "const": "extract" },
+        "path": { "type": "string", "minLength": 1 },
+        "row_key_field": { "type": "string", "minLength": 1 }
+      }
+    },
+    "filter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "field", "cmp", "value"],
+      "properties": {
+        "op": { "const": "filter" },
+        "field": { "type": "string", "minLength": 1 },
+        "cmp": { "enum": ["==", "!=", ">", "<", ">=", "<=", "contains"] },
+        "value": {}
+      }
+    },
+    "map": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "fields"],
+      "properties": {
+        "op": { "const": "map" },
+        "fields": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "string", "minLength": 1 },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["expr"],
+                "properties": {
+                  "expr": { "type": "string", "minLength": 1 }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "merge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "with", "on"],
+      "properties": {
+        "op": { "const": "merge" },
+        "with": { "type": "string", "minLength": 1 },
+        "on": { "type": "string", "minLength": 1 },
+        "how": { "enum": ["inner", "left"] }
+      }
+    },
+    "sort": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "field"],
+      "properties": {
+        "op": { "const": "sort" },
+        "field": { "type": "string", "minLength": 1 },
+        "order": { "enum": ["asc", "desc"] }
+      }
+    },
+    "limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "count"],
+      "properties": {
+        "op": { "const": "limit" },
+        "count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "unique": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "field"],
+      "properties": {
+        "op": { "const": "unique" },
+        "field": { "type": "string", "minLength": 1 }
+      }
+    },
+    "llm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "instruction", "input_fields", "output_field", "model_tier"],
+      "properties": {
+        "op": { "const": "llm" },
+        "instruction": { "type": "string", "minLength": 1 },
+        "input_fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "output_field": { "type": "string", "minLength": 1 },
+        "model_tier": { "enum": ["cheap", "standard", "smart"] }
+      }
+    }
+  }
+}

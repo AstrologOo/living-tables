@@ -1,0 +1,139 @@
+services:
+  app:
+    build: .
+    image: ${APP_IMAGE:-graph-backend-app:local}
+    volumes:
+      - .:/var/www/html
+    environment:
+      - APP_ENV=local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "${FORWARD_APP_PORT:-8080}:80"
+    volumes:
+      - .:/var/www/html
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - app
+
+  worker:
+    build: .
+    image: ${APP_IMAGE:-graph-backend-app:local}
+    command: php artisan graph:consume-node-jobs
+    # The php-fpm image stops with SIGQUIT; these are CLI processes.
+    stop_signal: SIGTERM
+    restart: unless-stopped
+    volumes:
+      - .:/var/www/html
+    environment:
+      - APP_ENV=local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+
+  scheduler:
+    build: .
+    image: ${APP_IMAGE:-graph-backend-app:local}
+    # routes/console.php declares graph:schedule-sources and
+    # graph:recover-stuck-nodes on ->everyMinute() — that only registers
+    # them, nothing actually ticks the clock without this process (Laravel
+    # has no built-in cron of its own). schedule:work is the single-process
+    # equivalent of an external `* * * * * schedule:run` cron entry: it
+    # sleeps and fires whatever's due once a minute, no host/container cron
+    # daemon needed. Exactly one replica — running two would double-fire
+    # both commands (duplicate stale-marks, duplicate publishRecalcTask)
+    # every minute they're both due.
+    command: php artisan schedule:work
+    # The php-fpm image stops with SIGQUIT; these are CLI processes.
+    stop_signal: SIGTERM
+    restart: unless-stopped
+    volumes:
+      - .:/var/www/html
+    environment:
+      - APP_ENV=local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+
+  reverb:
+    build: .
+    image: ${APP_IMAGE:-graph-backend-app:local}
+    # Push transport for node status/notification updates — the app
+    # container calls this over the docker network (REVERB_HOST=reverb in
+    # .env), a browser connects to the host-published port below
+    # (VITE_REVERB_PORT=8081 — 8080 is already nginx). Exactly one
+    # replica for now: Reverb supports horizontal scaling via its Redis
+    # "scaling" mode (config/reverb.php), not enabled here — not needed
+    # until connection count actually demands it.
+    command: php artisan reverb:start --host=0.0.0.0
+    ports:
+      - "${FORWARD_REVERB_PORT:-8081}:8080"
+    volumes:
+      - .:/var/www/html
+    environment:
+      - APP_ENV=local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: graph_backend_app
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: secret
+    ports:
+      - "${FORWARD_DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U root -d graph_backend_app"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    ports:
+      - "${FORWARD_REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: secret
+    ports:
+      - "${FORWARD_RABBITMQ_PORT:-5672}:5672"
+      - "${FORWARD_RABBITMQ_UI_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:

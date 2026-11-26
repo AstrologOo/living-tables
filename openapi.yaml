@@ -1,0 +1,1592 @@
+openapi: 3.0.3
+info:
+  title: Graph Backend API
+  description: >
+    "Living table graph" API: connect data sources, describe in words what
+    tables you want, and the system generates and runs a declarative DSL
+    pipeline, keeping results fresh via reactive invalidation. See
+    README.md for the model; this document describes the HTTP surface only.
+
+
+    Auth: Bearer token (Sanctum personal access token) on every route
+    except /register, /login, and the webhook ingest endpoint (which
+    authenticates via HMAC signature instead - see that operation's
+    description).
+
+
+    Ownership: every node/view/notification-scoped endpoint returns 404
+    (never 403) for a resource that exists but belongs to another user -
+    confirming existence to a non-owner would leak more than a flat 404
+    does.
+  version: "1.0.0"
+servers:
+  - url: http://localhost:8080
+    description: Local docker-compose (nginx on :8080)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Auth
+    description: Registration, login, logout - Sanctum personal access tokens.
+  - name: Nodes
+    description: Create, configure, and remove graph nodes.
+  - name: Node data
+    description: Read a node's currently-computed table.
+  - name: Views
+    description: Saved filter/sort/limit lenses over a node's data.
+  - name: Graph
+    description: The graph as a whole, and impact-of-change queries.
+  - name: Notifications
+    description: Data-changed / schema-drift / failure notifications.
+  - name: Sources
+    description: Trial-probe a URL before wiring it into a fetch step.
+  - name: Webhooks
+    description: Public ingest endpoint for webhook-triggered source nodes.
+
+paths:
+  # ---------------------------------------------------------------- Auth
+  /api/register:
+    post:
+      tags: [Auth]
+      summary: Register a new user
+      operationId: registerUser
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password]
+              properties:
+                name:
+                  type: string
+                  example: "Ada Lovelace"
+                email:
+                  type: string
+                  format: email
+                  example: "ada@example.test"
+                password:
+                  type: string
+                  format: password
+                  minLength: 8
+                  example: "correct horse battery staple"
+      responses:
+        '201':
+          description: >
+            Registered - token returned once, store it client-side.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/User'
+                  token:
+                    type: string
+                    description: Plaintext bearer token, shown only in this response.
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          description: 'Rate limited: 5 requests per minute per IP.'
+
+  /api/login:
+    post:
+      tags: [Auth]
+      summary: Log in and receive a new bearer token
+      operationId: loginUser
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                  format: password
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/User'
+                  token:
+                    type: string
+        '422':
+          description: >
+            Wrong password or unknown email - same message either way,
+            deliberately, so a failed attempt can't be used to enumerate
+            registered addresses.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationErrorBody'
+        '429':
+          description: 'Rate limited: 5 attempts per minute per email + IP pair, and 20 per IP.'
+
+  /api/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke the token this request authenticated with
+      operationId: logoutUser
+      description: >
+        Only the current token is revoked - a user's other active
+        sessions/tokens are untouched.
+      responses:
+        '204':
+          description: Logged out
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /api/me:
+    get:
+      tags: [Auth]
+      summary: The authenticated user
+      operationId: getCurrentUser
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  # --------------------------------------------------------------- Nodes
+  /api/nodes:
+    post:
+      tags: [Nodes]
+      summary: Create a node shell
+      operationId: createNode
+      description: >
+        Creates the node "shell" only - dsl_config starts empty, nothing
+        is computed yet. user_id is always the authenticated caller,
+        never a request field. Every declared parent_id must belong to
+        the caller too (otherwise 404 - a parent/merge step could
+        otherwise read someone else's data just by referencing their
+        node id).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, name]
+              properties:
+                type:
+                  type: string
+                  enum: [source, transform]
+                name:
+                  type: string
+                parent_ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  description: Must all belong to the caller.
+                trigger:
+                  type: string
+                  enum: [schedule, webhook]
+                  nullable: true
+                  description: Only valid when type=source.
+                schedule:
+                  type: string
+                  nullable: true
+                  description: A real cron expression. Required when trigger=schedule.
+                  example: "0 * * * *"
+      responses:
+        '201':
+          description: >
+            Created. When trigger=webhook, the response additionally
+            includes webhook_url - a ready-to-use URL embedding a
+            server-generated secret, shown once. The secret itself
+            (webhook_secret) is never included in any JSON response,
+            here or anywhere else - it doubles as the HMAC signing key
+            /webhooks/{node}/{secret} verifies requests against.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Node'
+                  - type: object
+                    properties:
+                      webhook_url:
+                        type: string
+                        nullable: true
+                        example: "http://localhost:8080/webhooks/0199.../3Xk9..."
+        '404':
+          description: One or more parent_ids don't exist or belong to another user.
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /api/nodes/{node}:
+    delete:
+      tags: [Nodes]
+      summary: Delete a node
+      operationId: deleteNode
+      description: >
+        Cascades to the node's own rows/versions/edges/notifications/
+        run_stats. Refuses (422) to delete a node other nodes still
+        depend on (a dangling parent/merge reference would otherwise
+        fail confusingly at the dependent's next recompute) - remove or
+        repoint those first.
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          $ref: '#/components/responses/NotFoundOrNotYours'
+        '422':
+          description: Other nodes still depend on this one.
+
+  /api/nodes/{node}/preview:
+    post:
+      tags: [Nodes]
+      summary: Preview a candidate dsl_config against real data
+      operationId: previewNode
+      description: >
+        Saves nothing. Provide either phrase (runs through the LLM DSL
+        generator) or dsl_config directly (skips generation). When a
+        phrase produces a config whose result is silently empty at some
+        step (rows_before > 0 and rows_after === 0, the deterministic
+        warnings signal), preview retries generation with the anomaly
+        fed back to the model, up to 3 total attempts, then returns the
+        last result with warnings rather than erroring. Pagination in a
+        fetch step always stops after the first page here, regardless of
+        max_pages - real pagination only happens in the background run
+        after apply().
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [phrase]
+                  properties:
+                    phrase:
+                      type: string
+                      example: "оставь только заказы дороже 1000"
+                - type: object
+                  required: [dsl_config]
+                  properties:
+                    dsl_config:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/DslStep'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dsl_config:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DslStep'
+                  rows:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Row'
+                  columns_schema:
+                    allOf:
+                      - $ref: '#/components/schemas/ColumnsSchema'
+                    description: The schema carried over from the parent the pipeline reads, if it reads one.
+                  inferred_columns_schema:
+                    allOf:
+                      - $ref: '#/components/schemas/ColumnsSchema'
+                    description: A draft schema inferred from this preview's own rows - pass to columns-schema to persist it.
+                  suggests_view:
+                    type: boolean
+                    description: True when dsl_config has no enrichment step (fetch/document/map/llm/merge/webhook_source) - a View may be more appropriate than a real node.
+                  warnings:
+                    type: array
+                    items:
+                      type: string
+                    description: One entry per step where rows_before > 0 but rows_after === 0.
+        '422':
+          description: DSL generation failed validation, or the pipeline threw at some step.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      errors:
+                        type: array
+                        items:
+                          type: string
+                  - type: object
+                    properties:
+                      error:
+                        type: string
+        '404':
+          $ref: '#/components/responses/NotFoundOrNotYours'
+        '503':
+          $ref: '#/components/responses/GenerationUnavailable'
+
+  /api/nodes/{node}/apply:
+    post:
+      tags: [Nodes]
+      summary: Save a dsl_config for real
+      operationId: applyNodeConfig
+      description: >
+        Marks the node stale and best-effort wakes a worker to recompute
+        it immediately (falls back to the normal poll/schedule cycle if
+        the AMQP nudge fails). webhook_source is accepted here even
+        though phrase-generation never offers it to the model - it's the
+        one legitimate way to build a webhook-triggered node's real
+        pipeline. Applying the config a failed node already has restarts
+        it: stale, with a clean failure count. `parent` and `merge` steps
+        may only read the node's declared parents (422 otherwise).
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [dsl_config]
+              properties:
+                dsl_config:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/DslStep'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node:
+                    $ref: '#/components/schemas/Node'
+                  changed:
+                    type: boolean
+                    description: >
+                      False when the config was already exactly this - no wake-up
+                      happens in that case, unless the node was failed and is
+                      restarted.
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFoundOrNotYours'
+
+  /api/nodes/{node}/columns-schema:
+    post:
+      tags: [Nodes]
+      summary: Confirm a columns_schema for the node
+      operationId: confirmNodeColumnsSchema
+      description: >
+        Persists a schema (typically inferred_columns_schema from a
+        preview, possibly hand-edited), to fix column names and types.
+        Optional: until then the schema is derived from each result.
+        Once confirmed it is no longer overwritten, and the node's next
+        recompute checks its output against it (schema-drift detection).
+        Doesn't touch dsl_config or status.
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [columns_schema]
+              properties:
+                columns_schema:
+                  $ref: '#/components/schemas/ColumnsSchema'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFoundOrNotYours'
+
+  /api/nodes/{node}/config-versions:
+    get:
+      tags: [Nodes]
+      summary: List the node's dsl_config history, newest first
+      operationId: listNodeConfigVersions
+      description: >
+        One entry per change of the computed steps. An apply() that changes
+        only the trailing sort/unique/limit updates the latest entry's tail.
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                      format: uuid
+                    dsl_config:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/DslStep'
+                    tail:
+                      type: array
+                      nullable: true
+                      items:
+                        $ref: '#/components/schemas/DslStep'
+                      description: >
+                        The trailing sort/unique/limit saved with it, which
+                        rollback restores as the default view. Null in old
+                        entries, whose rollback keeps the current view.
+                    config_hash:
+                      type: string
+                    created_at:
+                      type: string
+                      format: date-time
+        '404':
+          $ref: '#/components/responses/NotFoundOrNotYours'
+
+  /api/nodes/{node}/config-versions/{version}/rollback:
+    post:
+      tags: [Nodes]
+      summary: Revert to a past dsl_config version
+      operationId: rollbackNodeConfig
+      description: >
+        A config that reads a node other than a declared parent is
+        refused with 422.
+        Goes through the same path apply() uses - same stale-marking,
+        wake-up, and gets its own new history entry (a rollback is a
+        change, not a history rewrite).
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+        - name: version
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node:
+                    $ref: '#/components/schemas/Node'
+                  changed:
+                    type: boolean
+        '404':
+          description: Node not found/not yours, or the version id doesn't belong to this node.
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  # ---------------------------------------------------------- Node data
+  /api/nodes/{node}/rows:
+    get:
+      tags: [Node data]
+      summary: Read the node's currently-computed table
+      operationId: getNodeRows
+      description: >
+        Read-only - never touches dsl_config/status/triggers a
+        recompute, just reads whatever the last successful run produced.
+        Filters use the same vocabulary as a saved View's filter. In a
+        number column, a value that isn't a number (as JSON writes one,
+        below 1e100) counts as null: it matches no comparison and sorts
+        last. Filtering such a column by a non-number is 422, except with
+        contains. The same holds for views and aggregates.
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+        - name: filter[col_id]
+          in: query
+          description: 'Equality shorthand, e.g. filter[price]=100.'
+          schema:
+            type: string
+        - name: filter[col_id][cmp]
+          in: query
+          description: 'Range/contains form, e.g. filter[price][cmp]=>&filter[price][value]=100.'
+          schema:
+            type: string
+            enum: ["==", "!=", ">", "<", ">=", "<=", "contains"]
+        - name: filter[col_id][value]
+          in: query
+          schema: {}
+        - name: sort
+          in: query
+          description: 'A col_id, ascending; prefix with - for descending, e.g. -price.'
+          schema:
+            type: string
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 25
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedRows'
+        '422':
+          description: A column not in the node's schema, a malformed filter, or a non-number compared with a number column.
+        '404':
+          $ref: '#/components/responses/NotFoundOrNotYours'
+
+  /api/nodes/{node}/aggregate:
+    get:
+      tags: [Node data]
+      summary: One collapsed row of aggregates over the node's current rows
+      operationId: getNodeAggregate
+      description: >
+        Same filter vocabulary as /rows. col is ignored for count. sum, avg,
+        median, stddev and variance need a number column (422 otherwise).
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+        - name: aggregate[alias][fn]
+          in: query
+          required: true
+          description: 'One or more aliases, each with a function, e.g. aggregate[total][fn]=sum&aggregate[total][col]=price.'
+          schema:
+            type: string
+            enum: [count, count_distinct, sum, avg, min, max, median, stddev, variance]
+        - name: aggregate[alias][col]
+          in: query
+          schema:
+            type: string
+        - name: filter[col_id]
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: One key per requested alias; null values for a node with no version yet.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    additionalProperties:
+                      nullable: true
+                      description: A number; min and max of a text column are strings.
+                      oneOf:
+                        - type: number
+                        - type: string
+        '422':
+          description: Unknown function, undeclared column, or an unsafe alias.
+        '404':
+          $ref: '#/components/responses/NotFoundOrNotYours'
+
+  /api/nodes/{node}/live:
+    get:
+      tags: [Node data]
+      summary: In-progress run's live progress channel
+      operationId: getNodeLive
+      description: >
+        Whatever the currently-running recompute (if any) last reported -
+        always a draft, may still change before the real version
+        commits. Returns bare null (200) when no run is currently in
+        progress. Never touches node_rows/node_version_rows.
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      responses:
+        '200':
+          description: 'OK - null body, or a draft snapshot.'
+          content:
+            application/json:
+              schema:
+                nullable: true
+                type: object
+                properties:
+                  processed:
+                    type: integer
+                    nullable: true
+                  rows:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Row'
+                  updated_at:
+                    type: string
+                    format: date-time
+                    nullable: true
+                  draft:
+                    type: boolean
+                    enum: [true]
+        '404':
+          $ref: '#/components/responses/NotFoundOrNotYours'
+
+  # ----------------------------------------------------------------- Views
+  /api/nodes/{node}/views:
+    post:
+      tags: [Views]
+      summary: Save a filter/sort/limit view over a node
+      operationId: createNodeView
+      description: >
+        A view stores criteria only - no data of its own, no status, no
+        history. Always reads the node's current version live.
+
+
+        Provide either explicit criteria fields, or `phrase` to have the
+        LLM (ViewCriteriaGenerator, a much smaller sibling of the node DSL
+        generator - a view has no pipeline, only filter/sort/unique/limit
+        over one already-known column set) infer them. Unlike node
+        creation (store -> preview -> apply), a view has no separate
+        preview step: generation and persistence happen in this one call,
+        since undoing an unwanted view is just DELETE /views/{view}. When
+        `phrase` produces criteria that match zero rows on a node that
+        actually has data, generation retries with that fed back to the
+        model, up to 3 total attempts, then persists the last result
+        regardless.
+
+
+        Criteria are checked against the node's columns as when rows are
+        read, so a node without columns yet accepts only a view that names
+        none. The filter is saved and returned with every condition as
+        {cmp, value}.
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - title: Explicit criteria
+                  type: object
+                  required: [name]
+                  properties:
+                    name:
+                      type: string
+                    filter:
+                      type: object
+                      description: 'Per column: a bare scalar for equality, or {cmp, value} (cmp defaults to ==; no other keys).'
+                      additionalProperties:
+                        oneOf:
+                          - {}
+                          - type: object
+                            required: [value]
+                            additionalProperties: false
+                            properties:
+                              cmp:
+                                type: string
+                                enum: ["==", "!=", ">", "<", ">=", "<=", "contains"]
+                              value: {}
+                    sort_field:
+                      type: string
+                      nullable: true
+                    sort_order:
+                      type: string
+                      enum: [asc, desc]
+                      nullable: true
+                    unique_field:
+                      type: string
+                      nullable: true
+                    limit_count:
+                      type: integer
+                      minimum: 1
+                      nullable: true
+                - title: From phrase (LLM)
+                  type: object
+                  required: [name, phrase]
+                  properties:
+                    name:
+                      type: string
+                    phrase:
+                      type: string
+            examples:
+              explicitCriteria:
+                summary: Explicit criteria
+                value:
+                  name: "Top bugs"
+                  filter:
+                    category: "bug"
+                  sort_field: "comments"
+                  sort_order: "desc"
+                  limit_count: 5
+              fromPhrase:
+                summary: From phrase (LLM)
+                value:
+                  name: "Дорогие снеки"
+                  phrase: "покажи только категорию snacks с ценой больше 4, отсортируй по цене по убыванию"
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/NodeView'
+                  - type: object
+                    properties:
+                      rows:
+                        type: array
+                        description: Only present when the view was created from `phrase` - the criteria applied live, at most 200 rows, each shaped as in GET /views/{view}/rows.
+                        items:
+                          $ref: '#/components/schemas/Row'
+        '404':
+          $ref: '#/components/responses/NotFoundOrNotYours'
+        '422':
+          description: 'Nothing is saved: explicit criteria name an unknown column, compare a number column with a non-number or are malformed; or phrase-generated criteria never validated (schema-invalid, or referenced a column that doesn''t exist on this node) after retrying, or put two conditions on one column (a view holds one per column).'
+        '503':
+          $ref: '#/components/responses/GenerationUnavailable'
+    get:
+      tags: [Views]
+      summary: List a node's saved views, newest first
+      operationId: listNodeViews
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/NodeView'
+        '404':
+          $ref: '#/components/responses/NotFoundOrNotYours'
+
+  /api/views/{view}/rows:
+    get:
+      tags: [Views]
+      summary: Read a view's rows
+      operationId: getViewRows
+      description: >
+        Its saved criteria applied live against the node's current data.
+        Paginated: the view's limit_count caps the total, pages are cut
+        from inside it.
+      parameters:
+        - name: view
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 25
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Row'
+                  columns:
+                    $ref: '#/components/schemas/ColumnsSchema'
+                  meta:
+                    type: object
+                    properties:
+                      current_page:
+                        type: integer
+                      per_page:
+                        type: integer
+                        description: 0 when the node has no version yet.
+                      total:
+                        type: integer
+                      last_page:
+                        type: integer
+        '422':
+          description: The saved filter references an unsupported cmp or an undeclared column.
+        '404':
+          $ref: '#/components/responses/NotFoundOrNotYours'
+
+  /api/views/{view}:
+    delete:
+      tags: [Views]
+      summary: Delete a view
+      operationId: deleteView
+      description: The underlying node is untouched.
+      parameters:
+        - name: view
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          $ref: '#/components/responses/NotFoundOrNotYours'
+
+  # ----------------------------------------------------------------- Graph
+  /api/graph:
+    get:
+      tags: [Graph]
+      summary: The caller's own nodes and edges
+      operationId: getGraph
+      description: Scoped to the authenticated user - never returns another user's nodes/edges.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nodes:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                        name:
+                          type: string
+                        type:
+                          type: string
+                          enum: [source, transform]
+                        status:
+                          $ref: '#/components/schemas/NodeStatus'
+                  edges:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        node_id:
+                          type: string
+                          format: uuid
+                        depends_on_id:
+                          type: string
+                          format: uuid
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /api/nodes/{node}/impact:
+    get:
+      tags: [Graph]
+      summary: How many downstream nodes editing this one would affect
+      operationId: getNodeImpact
+      parameters:
+        - $ref: '#/components/parameters/NodeId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node_id:
+                    type: string
+                    format: uuid
+                  affected_count:
+                    type: integer
+                  affected_node_ids:
+                    type: array
+                    items:
+                      type: string
+                      format: uuid
+        '404':
+          $ref: '#/components/responses/NotFoundOrNotYours'
+
+  # ---------------------------------------------------------- Notifications
+  /api/notifications:
+    get:
+      tags: [Notifications]
+      summary: The caller's notifications, newest first
+      operationId: listNotifications
+      parameters:
+        - name: unread_only
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Notification'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /api/notifications/{notification}/read:
+    post:
+      tags: [Notifications]
+      summary: Mark a notification read
+      operationId: markNotificationRead
+      parameters:
+        - name: notification
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Notification'
+        '404':
+          $ref: '#/components/responses/NotFoundOrNotYours'
+
+  # -------------------------------------------------------------- Sources
+  /api/sources/probe:
+    post:
+      tags: [Sources]
+      summary: Trial-fetch a URL and report its detected shape
+      operationId: probeSource
+      description: >
+        Throttled 10/min per user against probe-as-scanner abuse.
+        SSRF-blocked targets (link-local/internal ranges) return 422,
+        not a raw connection error.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  format: uri
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  format:
+                    type: string
+                    enum: [json, csv, html]
+                  pagination:
+                    type: object
+                    nullable: true
+                    properties:
+                      strategy:
+                        type: string
+                        enum: [page_param, offset, cursor, link_header]
+                  sample:
+                    description: >
+                      The response's shape with the first 5 rows of the detected
+                      list, at most 64 KB: if bigger, nested lists and long
+                      strings are cut as well, and null if it still doesn't fit.
+                      Null for non-JSON responses.
+        '422':
+          description: >
+            Missing url, or the source couldn't be fetched - `error` says which
+            way (forbidden address, unreachable, too many redirects, HTTP status,
+            too large) without naming hosts or IPs.
+        '429':
+          description: Rate-limited (10 per minute per user).
+
+  # ------------------------------------------------------------- Webhooks
+  /webhooks/{node}/{secret}:
+    post:
+      tags: [Webhooks]
+      summary: Ingest a webhook payload for a webhook-triggered source node
+      operationId: ingestWebhook
+      security: []
+      description: >
+        Not Bearer-authenticated - this is the one endpoint external
+        systems call directly. The URL's {secret} segment only routes
+        the request; the real authentication is an HMAC-SHA256 signature
+        over the raw request body, keyed by that same secret (obtained
+        once from POST /api/nodes's webhook_url at creation), sent as
+        X-Webhook-Signature. A wrong node id, wrong secret, or a node
+        that isn't a webhook source all return the same 404 - nothing
+        here should help an attacker distinguish those cases. Errors are
+        JSON ({"message": ...}).
+
+
+        On success, the payload is stored as-is (extract still runs at
+        recompute, exactly like a polled fetch source) and the node is
+        marked stale; a worker wake-up is attempted best-effort (a queue
+        hiccup never turns into a failed response for a sender that
+        already succeeded at storing its data).
+      parameters:
+        - name: node
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: secret
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Webhook-Signature
+          in: header
+          required: true
+          description: hex(HMAC-SHA256(raw request body, secret))
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Arbitrary JSON - becomes the node's webhook_payload as-is.
+      responses:
+        '204':
+          description: Accepted
+        '403':
+          description: Signature missing or doesn't match.
+        '404':
+          description: No such node, wrong secret, or not a webhook-triggered source.
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Sanctum personal access token
+
+  parameters:
+    NodeId:
+      name: node
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    Unauthenticated:
+      description: No or invalid bearer token.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message:
+                type: string
+                example: "Unauthenticated."
+    NotFoundOrNotYours:
+      description: Doesn't exist, or belongs to another user - same response either way.
+    GenerationUnavailable:
+      description: The LLM provider gave no usable answer to a phrase, or none is configured.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: "сервис генерации недоступен"
+    ValidationError:
+      description: Validation failed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ValidationErrorBody'
+
+  schemas:
+    ValidationErrorBody:
+      type: object
+      properties:
+        message:
+          type: string
+        errors:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+
+    User:
+      type: object
+      description: password/remember_token are never serialized.
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    NodeStatus:
+      type: string
+      enum: [fresh, stale, processing, failed, schema_drift]
+      description: >
+        A failed node's children stay on their last good version (not
+        marked stale). A parent's new version marks a failed node stale
+        again, for another run. schema_drift halts recomputation on that
+        branch until a human fixes the column mapping - except on a webhook
+        source, which any new payload queues again.
+
+    ColumnsSchema:
+      type: object
+      description: col_id to {name, type}.
+      additionalProperties:
+        type: object
+        properties:
+          name:
+            type: string
+          type:
+            type: string
+            nullable: true
+            example: "string | number | boolean"
+
+    Node:
+      type: object
+      description: webhook_secret is never included - see POST /api/nodes.
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: integer
+        type:
+          type: string
+          enum: [source, transform]
+        name:
+          type: string
+        dsl_config:
+          type: array
+          items:
+            $ref: '#/components/schemas/DslStep'
+        columns_schema:
+          $ref: '#/components/schemas/ColumnsSchema'
+        columns_schema_confirmed:
+          type: boolean
+          description: False while columns_schema just follows the latest result.
+        schedule:
+          type: string
+          nullable: true
+        status:
+          $ref: '#/components/schemas/NodeStatus'
+        content_hash:
+          type: string
+          nullable: true
+        config_hash:
+          type: string
+        current_version_id:
+          type: string
+          format: uuid
+          nullable: true
+        trigger:
+          type: string
+          enum: [schedule, webhook]
+          nullable: true
+        webhook_payload:
+          type: object
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    NodeView:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: integer
+        node_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        filter:
+          type: object
+          nullable: true
+          description: 'col_id => {cmp, value}. Views saved earlier may hold a bare value, meaning equality.'
+        sort_field:
+          type: string
+          nullable: true
+        sort_order:
+          type: string
+          enum: [asc, desc]
+          nullable: true
+        unique_field:
+          type: string
+          nullable: true
+        limit_count:
+          type: integer
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    Notification:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: integer
+        node_id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [data_changed, schema_drift, failed]
+        payload:
+          type: object
+        read_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    Row:
+      type: object
+      properties:
+        row_key:
+          type: string
+        data:
+          type: object
+          additionalProperties: {}
+
+    PaginatedRows:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+        columns:
+          $ref: '#/components/schemas/ColumnsSchema'
+        meta:
+          type: object
+          properties:
+            current_page:
+              type: integer
+            per_page:
+              type: integer
+            total:
+              type: integer
+            last_page:
+              type: integer
+
+    Pagination:
+      type: object
+      required: [strategy, items_path, max_pages]
+      properties:
+        strategy:
+          type: string
+          enum: [page_param, offset, cursor, link_header]
+        items_path:
+          type: string
+          description: JSONPath to the array of items on each page.
+        param:
+          type: string
+          description: Required for page_param/offset.
+        start:
+          type: integer
+          minimum: 0
+        cursor_path:
+          type: string
+          description: Required for the cursor strategy.
+        stop_when:
+          type: string
+          enum: [empty_page, no_cursor, max_pages]
+        max_pages:
+          type: integer
+          minimum: 1
+          maximum: 1000
+        max_rows:
+          type: integer
+          minimum: 1
+          maximum: 200000
+        delay_ms:
+          type: integer
+          minimum: 0
+          maximum: 5000
+
+    DslStep:
+      description: >
+        One step of a dsl_config pipeline. The first step is always a
+        source (fetch/parent/document/webhook_source) and produces the
+        input the rest of the chain transforms in order. sort/unique/
+        limit only run as a trailing block (moved into the node's
+        default View at save time, not part of the computed pipeline) -
+        anywhere else is a validation error.
+      oneOf:
+        - $ref: '#/components/schemas/DslFetch'
+        - $ref: '#/components/schemas/DslParent'
+        - $ref: '#/components/schemas/DslDocument'
+        - $ref: '#/components/schemas/DslWebhookSource'
+        - $ref: '#/components/schemas/DslExtract'
+        - $ref: '#/components/schemas/DslFilter'
+        - $ref: '#/components/schemas/DslMap'
+        - $ref: '#/components/schemas/DslMerge'
+        - $ref: '#/components/schemas/DslSort'
+        - $ref: '#/components/schemas/DslLimit'
+        - $ref: '#/components/schemas/DslUnique'
+        - $ref: '#/components/schemas/DslLlm'
+      discriminator:
+        propertyName: op
+        mapping:
+          fetch: '#/components/schemas/DslFetch'
+          parent: '#/components/schemas/DslParent'
+          document: '#/components/schemas/DslDocument'
+          webhook_source: '#/components/schemas/DslWebhookSource'
+          extract: '#/components/schemas/DslExtract'
+          filter: '#/components/schemas/DslFilter'
+          map: '#/components/schemas/DslMap'
+          merge: '#/components/schemas/DslMerge'
+          sort: '#/components/schemas/DslSort'
+          limit: '#/components/schemas/DslLimit'
+          unique: '#/components/schemas/DslUnique'
+          llm: '#/components/schemas/DslLlm'
+
+    DslFetch:
+      type: object
+      required: [op, url, format]
+      additionalProperties: false
+      properties:
+        op:
+          type: string
+          enum: [fetch]
+        url:
+          type: string
+          minLength: 1
+        format:
+          type: string
+          enum: [json, csv, html]
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    DslParent:
+      type: object
+      required: [op, node]
+      additionalProperties: false
+      properties:
+        op:
+          type: string
+          enum: [parent]
+        node:
+          type: string
+          description: A declared parent's node id.
+
+    DslDocument:
+      type: object
+      required: [op, file_ref]
+      additionalProperties: false
+      properties:
+        op:
+          type: string
+          enum: [document]
+        file_ref:
+          type: string
+          minLength: 1
+
+    DslWebhookSource:
+      type: object
+      required: [op]
+      additionalProperties: false
+      description: >
+        No fields beyond op. Only valid on a trigger=webhook node, and
+        only accepted by apply() - never offered to the phrase-generation
+        model.
+      properties:
+        op:
+          type: string
+          enum: [webhook_source]
+
+    DslExtract:
+      type: object
+      required: [op, path]
+      additionalProperties: false
+      properties:
+        op:
+          type: string
+          enum: [extract]
+        path:
+          type: string
+          description: 'JSONPath (json/csv) or a CSS selector (html). $[*] is required right after a paginated fetch.'
+        row_key_field:
+          type: string
+          description: Which field identifies a row across recomputes.
+
+    DslFilter:
+      type: object
+      required: [op, field, cmp, value]
+      additionalProperties: false
+      description: contains is a literal substring match (str_contains), not a regex.
+      properties:
+        op:
+          type: string
+          enum: [filter]
+        field:
+          type: string
+        cmp:
+          type: string
+          enum: ["==", "!=", ">", "<", ">=", "<=", "contains"]
+        value: {}
+
+    DslMap:
+      type: object
+      required: [op, fields]
+      additionalProperties: false
+      properties:
+        op:
+          type: string
+          enum: [map]
+        fields:
+          type: object
+          minProperties: 1
+          description: 'new_col_id to existing col_id (rename/copy), or {expr} for a computed value.'
+          additionalProperties:
+            oneOf:
+              - type: string
+              - type: object
+                required: [expr]
+                properties:
+                  expr:
+                    type: string
+
+    DslMerge:
+      type: object
+      required: [op, with, on]
+      additionalProperties: false
+      properties:
+        op:
+          type: string
+          enum: [merge]
+        with:
+          type: string
+          description: A declared parent's node id.
+        on:
+          type: string
+          description: A column present on both sides.
+        how:
+          type: string
+          enum: [inner, left]
+          default: inner
+
+    DslSort:
+      type: object
+      required: [op, field]
+      additionalProperties: false
+      properties:
+        op:
+          type: string
+          enum: [sort]
+        field:
+          type: string
+        order:
+          type: string
+          enum: [asc, desc]
+
+    DslLimit:
+      type: object
+      required: [op, count]
+      additionalProperties: false
+      properties:
+        op:
+          type: string
+          enum: [limit]
+        count:
+          type: integer
+          minimum: 0
+
+    DslUnique:
+      type: object
+      required: [op, field]
+      additionalProperties: false
+      properties:
+        op:
+          type: string
+          enum: [unique]
+        field:
+          type: string
+
+    DslLlm:
+      type: object
+      required: [op, instruction, input_fields, output_field, model_tier]
+      additionalProperties: false
+      description: >
+        Adds exactly one new column. Cached by sha256(row_hash +
+        operation_hash + model_id); place filter/limit before this step
+        to bound cost.
+      properties:
+        op:
+          type: string
+          enum: [llm]
+        instruction:
+          type: string
+        input_fields:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        output_field:
+          type: string
+        model_tier:
+          type: string
+          enum: [cheap, standard, smart]
